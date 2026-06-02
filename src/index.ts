@@ -1,15 +1,42 @@
-const command = process.argb[2];
+import { runInit } from "./commands/init.js";
+import { runWatch } from "./commands/watch.js";
+import { createInterface } from "node:readline/promises";
+import { stdin, stdout } from "node:process";
 
-if (command === "start") runInit();
-else if (command === "watch") runWatch();
-else console.log("Usage: veiny [start|watch]");
+async function main(): Promise<void> {
+  const interfaceInstance = createInterface({
+    input: stdin,
+    output: stdout,
+  });
 
-function runInit() {
-  console.log("Initializing project...");
-  // Add initialization logic here
+  try {
+    while (true) {
+      console.log("Type start, watch, or quit:");
+
+      const command = (await interfaceInstance.question("> "))
+        .trim()
+        .toLowerCase();
+
+      if (command === "start") {
+        await runInit();
+        return;
+      }
+
+      if (command === "watch") {
+        await runWatch();
+        return;
+      }
+
+      if (command === "quit") {
+        console.log("Goodbye.");
+        return;
+      }
+
+      console.log("Invalid input. Please try again.");
+    }
+  } finally {
+    interfaceInstance.close();
+  }
 }
 
-function runWatch() {
-  console.log("Watching for changes...");
-  // Add watch logic here
-}
+void main();
