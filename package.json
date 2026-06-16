@@ -8,7 +8,9 @@
     "build": "tsc",
     "start": "tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
-    "test": "npm run build"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "repository": {
     "type": "git",
@@ -22,8 +24,14 @@
   },
   "homepage": "https://github.com/sunburnt716/veiny#readme",
   "devDependencies": {
+    "@types/babel__traverse": "^7.28.0",
     "@types/node": "^24.0.10",
     "tsx": "^4.20.5",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9"
+  },
+  "dependencies": {
+    "@babel/parser": "^7.29.7",
+    "@babel/traverse": "^7.29.7"
   }
 }

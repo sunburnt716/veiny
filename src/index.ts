@@ -1,5 +1,9 @@
-import { runInit } from "./commands/init.js";
+import { captureConfig, runInit, validateGitRepo } from "./commands/init.js";
 import { runWatch } from "./commands/watch.js";
+import {
+  buildDependencyGraph,
+  dependencyGraphExists,
+} from "./utils/dependencyGraph.js";
 import readline from "node:readline";
 import { stdin, stdout } from "node:process";
 
@@ -40,8 +44,49 @@ async function main(): Promise<void> {
         .toLowerCase();
 
       if (line === "start") {
+        // Close the loop's interface before runInit so its own readline prompt has sole
+        // ownership of stdin.
         rl.close();
         await runInit();
+
+        // runInit returns void, so re-derive repoRoot + config from the exported helpers to
+        // feed the dependency-graph build.
+        const repoRoot = validateGitRepo();
+        if (repoRoot.startsWith("Error:")) {
+          console.error(repoRoot);
+          return;
+        }
+        const config = captureConfig(repoRoot);
+
+        // Build automatically when no graph exists yet; otherwise ask before reparsing.
+        let shouldBuild = true;
+        if (dependencyGraphExists(repoRoot)) {
+          const rl2 = readline.createInterface({
+            input: stdin,
+            output: stdout,
+            terminal: true,
+          });
+          try {
+            const answer = (
+              await question(
+                rl2,
+                "A Veiny dependency graph already exists. Reparse the codebase and update it? (y/n) ",
+              )
+            )
+              .trim()
+              .toLowerCase();
+            shouldBuild = answer === "y" || answer === "yes";
+          } finally {
+            rl2.close();
+          }
+          if (!shouldBuild) {
+            console.log("Keeping the existing dependency graph.");
+          }
+        }
+
+        if (shouldBuild) {
+          buildDependencyGraph(repoRoot, config);
+        }
         return;
       }
 

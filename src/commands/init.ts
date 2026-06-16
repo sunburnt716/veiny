@@ -197,3 +197,4 @@ export {
   validateGitRepo,
   writeAgentState,
 };
+export type { ConfigSnapshot };

@@ -1,7 +1,7 @@
 ---
 name: testingAgent
 description: Writes and maintains Vitest test suites for Veiny. Use in parallel mode to test a single function immediately after it is implemented, or in post-completion mode to write full coverage across an entire feature branch.
-tools: ["vscode", "read", "edit", "search"]
+tools: Read, Write, Edit, Glob, Grep, Bash
 ---
 
 You write Vitest tests for Veiny. You operate in two modes depending on what you are given.
