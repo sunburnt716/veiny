@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
+import type { FileDiff } from "../core/types.js";
 import { detectStagedCommit } from "./watch.js";
 
 const tempDirs: string[] = [];
@@ -18,6 +19,9 @@ function makeTempGitRepo(): string {
   const dir = realpathSync(mkdtempSync(path.join(tmpdir(), "veiny-watch-")));
   tempDirs.push(dir);
   execSync("git init", { cwd: dir, stdio: "ignore" });
+  // Identity so commits succeed in a clean CI environment.
+  execSync('git config user.email "test@example.com"', { cwd: dir, stdio: "ignore" });
+  execSync('git config user.name "Veiny Test"', { cwd: dir, stdio: "ignore" });
   return dir;
 }
 
@@ -25,6 +29,14 @@ function makeTempDir(): string {
   const dir = realpathSync(mkdtempSync(path.join(tmpdir(), "veiny-watch-")));
   tempDirs.push(dir);
   return dir;
+}
+
+function findDiff(diffs: FileDiff[], filePath: string): FileDiff {
+  const match = diffs.find((d) => d.filePath === filePath);
+  if (!match) {
+    throw new Error(`expected a FileDiff for ${filePath}, got: ${JSON.stringify(diffs)}`);
+  }
+  return match;
 }
 
 afterEach(() => {
@@ -37,32 +49,65 @@ afterEach(() => {
 });
 
 describe("detectStagedCommit", () => {
-  it("returns the list of files staged for commit", () => {
+  it("returns FileDiff[] with repo-relative paths for newly staged files", () => {
     const dir = makeTempGitRepo();
-    writeFileSync(path.join(dir, "alpha.txt"), "hello", "utf8");
-    writeFileSync(path.join(dir, "beta.txt"), "world", "utf8");
-    execSync("git add alpha.txt beta.txt", { cwd: dir, stdio: "ignore" });
+    writeFileSync(path.join(dir, "alpha.ts"), "export const a = 1;\n", "utf8");
+    writeFileSync(path.join(dir, "beta.ts"), "export const b = 2;\n", "utf8");
+    execSync("git add alpha.ts beta.ts", { cwd: dir, stdio: "ignore" });
 
-    const staged = detectStagedCommit(dir);
+    const diffs = detectStagedCommit(dir);
 
-    expect(staged.sort()).toEqual(["alpha.txt", "beta.txt"]);
+    const paths = diffs.map((d) => d.filePath).sort();
+    expect(paths).toEqual(["alpha.ts", "beta.ts"]);
+  });
+
+  it("parses new-side hunk ranges (startLine/lineCount) for a staged edit", () => {
+    const dir = makeTempGitRepo();
+    // Commit a baseline so the modification produces a real hunk header.
+    const baseline = [
+      "export const one = 1;",
+      "export const two = 2;",
+      "export const three = 3;",
+      "",
+    ].join("\n");
+    writeFileSync(path.join(dir, "mod.ts"), baseline, "utf8");
+    execSync("git add mod.ts", { cwd: dir, stdio: "ignore" });
+    execSync("git commit -m baseline", { cwd: dir, stdio: "ignore" });
+
+    // Change line 2 only, then stage it.
+    const edited = [
+      "export const one = 1;",
+      "export const two = 22;",
+      "export const three = 3;",
+      "",
+    ].join("\n");
+    writeFileSync(path.join(dir, "mod.ts"), edited, "utf8");
+    execSync("git add mod.ts", { cwd: dir, stdio: "ignore" });
+
+    const diffs = detectStagedCommit(dir);
+
+    const modDiff = findDiff(diffs, "mod.ts");
+    expect(modDiff.hunks.length).toBeGreaterThanOrEqual(1);
+    // With -U0, the changed line 2 is reported as a single new-side line at startLine 2.
+    expect(modDiff.hunks).toContainEqual({ startLine: 2, lineCount: 1 });
   });
 
   it("returns an empty array when nothing is staged", () => {
     const dir = makeTempGitRepo();
-    writeFileSync(path.join(dir, "unstaged.txt"), "data", "utf8");
+    // Present but unstaged -> not in `git diff --cached`.
+    writeFileSync(path.join(dir, "unstaged.ts"), "export const u = 0;\n", "utf8");
 
-    const staged = detectStagedCommit(dir);
+    const diffs = detectStagedCommit(dir);
 
-    expect(staged).toEqual([]);
+    expect(diffs).toEqual([]);
   });
 
   it("returns an empty array when the directory is not a git repository", () => {
     const dir = makeTempDir();
 
-    const staged = detectStagedCommit(dir);
+    const diffs = detectStagedCommit(dir);
 
-    expect(staged).toEqual([]);
+    expect(diffs).toEqual([]);
   });
 });
 

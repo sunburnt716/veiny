@@ -1,0 +1,182 @@
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import * as path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+
+import type { ConfigSnapshot } from "../commands/init.js";
+import type { DependentMap, ReportEntry } from "../core/types.js";
+import {
+  dependencyGraphExists,
+  readDependentMap,
+  writeAgentState,
+  writeDependencyMaps,
+  writeReport,
+} from "./agentState.js";
+
+const tempDirs: string[] = [];
+
+function makeTempDir(): string {
+  const dir = realpathSync(mkdtempSync(path.join(tmpdir(), "veiny-state-")));
+  tempDirs.push(dir);
+  return dir;
+}
+
+function emptyConfig(): ConfigSnapshot {
+  return {
+    nodeVersion: process.version,
+    packageManager: "unknown",
+    languageSpecificConfigs: {},
+    pathAliasses: {},
+    packageManagerSettings: {},
+    workspaces: [],
+  };
+}
+
+afterEach(() => {
+  while (tempDirs.length > 0) {
+    const dir = tempDirs.pop();
+    if (dir && existsSync(dir)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+describe("writeReport", () => {
+  it("writes report.json containing the passed report", () => {
+    const repoRoot = makeTempDir();
+    const report: ReportEntry[] = [
+      {
+        type: "typeCheck",
+        data: [
+          {
+            filePath: "src/a.ts",
+            line: 3,
+            column: 7,
+            message: "Type 'string' is not assignable to type 'number'.",
+            code: 2322,
+            category: "error",
+            inChangedHunk: true,
+          },
+        ],
+      },
+      {
+        type: "blastRadius",
+        data: [
+          {
+            affectedFile: "src/b.ts",
+            changedFile: "src/a.ts",
+            affectedSymbols: "all",
+            precision: "file",
+          },
+        ],
+      },
+    ];
+
+    writeReport(repoRoot, report);
+
+    const reportPath = path.join(repoRoot, ".agent", "report.json");
+    expect(existsSync(reportPath)).toBe(true);
+    const onDisk: unknown = JSON.parse(readFileSync(reportPath, "utf8"));
+    expect(onDisk).toEqual(report);
+  });
+});
+
+describe("readDependentMap", () => {
+  it("returns {} when the file is absent", () => {
+    const repoRoot = makeTempDir();
+
+    expect(readDependentMap(repoRoot)).toEqual({});
+  });
+
+  it("returns the parsed object when the file is present", () => {
+    const repoRoot = makeTempDir();
+    const map: DependentMap = { "src/lib.ts": ["src/a.ts", "src/b.ts"] };
+    writeDependencyMaps(repoRoot, {
+      dependencyMap: {},
+      dependentMap: map,
+    });
+
+    expect(readDependentMap(repoRoot)).toEqual(map);
+  });
+
+  it("returns {} for a corrupt / non-object file and does not throw", () => {
+    const repoRoot = makeTempDir();
+    mkdirSync(path.join(repoRoot, ".agent"), { recursive: true });
+    // Invalid JSON.
+    writeFileSync(
+      path.join(repoRoot, ".agent", "dependentMap.json"),
+      "{ this is not valid json",
+      "utf8",
+    );
+
+    expect(() => readDependentMap(repoRoot)).not.toThrow();
+    expect(readDependentMap(repoRoot)).toEqual({});
+  });
+
+  it("returns {} when the file parses to a non-object (e.g. an array)", () => {
+    const repoRoot = makeTempDir();
+    mkdirSync(path.join(repoRoot, ".agent"), { recursive: true });
+    writeFileSync(
+      path.join(repoRoot, ".agent", "dependentMap.json"),
+      JSON.stringify(["not", "a", "map"]),
+      "utf8",
+    );
+
+    expect(readDependentMap(repoRoot)).toEqual({});
+  });
+});
+
+describe("writeAgentState", () => {
+  it("writes repoInfo and configInfo and userContext when context is provided", () => {
+    const repoRoot = makeTempDir();
+
+    writeAgentState(repoRoot, emptyConfig(), "some project context");
+
+    const agentDir = path.join(repoRoot, ".agent");
+    expect(existsSync(path.join(agentDir, "repoInfo.json"))).toBe(true);
+    expect(existsSync(path.join(agentDir, "configInfo.json"))).toBe(true);
+    expect(existsSync(path.join(agentDir, "userContext.md"))).toBe(true);
+
+    const repoInfo: unknown = JSON.parse(
+      readFileSync(path.join(agentDir, "repoInfo.json"), "utf8"),
+    );
+    expect(repoInfo).toEqual({ repoRoot });
+    expect(
+      readFileSync(path.join(agentDir, "userContext.md"), "utf8"),
+    ).toContain("some project context");
+  });
+
+  it("skips userContext.md when context is empty", () => {
+    const repoRoot = makeTempDir();
+
+    writeAgentState(repoRoot, emptyConfig(), "");
+
+    const agentDir = path.join(repoRoot, ".agent");
+    expect(existsSync(path.join(agentDir, "repoInfo.json"))).toBe(true);
+    expect(existsSync(path.join(agentDir, "configInfo.json"))).toBe(true);
+    expect(existsSync(path.join(agentDir, "userContext.md"))).toBe(false);
+  });
+});
+
+describe("dependencyGraphExists", () => {
+  it("is false before writeDependencyMaps and true after", () => {
+    const repoRoot = makeTempDir();
+
+    expect(dependencyGraphExists(repoRoot)).toBe(false);
+
+    writeDependencyMaps(repoRoot, {
+      dependencyMap: { "a.ts": ["b.ts"] },
+      dependentMap: { "b.ts": ["a.ts"] },
+    });
+
+    expect(dependencyGraphExists(repoRoot)).toBe(true);
+  });
+});

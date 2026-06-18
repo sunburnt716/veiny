@@ -10,9 +10,10 @@
  * and easy for other agents/humans to cross-reference. Parsing is done with Babel's AST so we
  * understand real import/export relationships rather than guessing with text matching.
  *
- * Flow: buildDependencyGraph() -> initializeDependencyGraph() creates the files, walkAndParse()
- * recurses the tree calling extractImports() + resolveImport() per file and addEdge() per edge
- * (mutating in-memory maps), then the populated maps are written once.
+ * Flow: buildDependencyGraph() asks agentState to create the files, walkAndParse() recurses the
+ * tree calling extractImports() + resolveImport() per file and addEdge() per edge (mutating
+ * in-memory maps), then agentState persists the populated maps once. All .agent/ writes go through
+ * src/state/agentState.ts — this module never touches the .agent/ directory directly.
  */
 
 import { parse } from "@babel/parser";
@@ -25,44 +26,26 @@ import type {
   ImportDeclaration,
   Node,
 } from "@babel/types";
-import {
-  existsSync,
-  mkdirSync,
-  readdirSync,
-  readFileSync,
-  statSync,
-  writeFileSync,
-  type Dirent,
-} from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync, type Dirent } from "node:fs";
 import * as path from "node:path";
 import type { ConfigSnapshot } from "../commands/init.js";
+import type { DependencyMap, DependencyMaps } from "../core/types.js";
+import {
+  initializeDependencyGraph,
+  writeDependencyMaps,
+} from "../state/agentState.js";
 
 /*
  * @babel/traverse is published as CommonJS. Imported under ESM the namespace object is what we
  * receive, and the actual callable lives on `.default`. Normalize once so the rest of the file
- * just calls `traverse(...)`. The `?? _traverse` keeps it working if a future build exposes the
- * function directly.
+ * just calls `traverse(...)`. The `?? traverseExport` keeps it working if a future build exposes
+ * the function directly.
  */
 type TraverseFunction = (node: Node, options: TraverseOptions) => void;
 const traverseExport = _traverse as unknown as TraverseFunction & {
   default?: TraverseFunction;
 };
 const traverse: TraverseFunction = traverseExport.default ?? traverseExport;
-
-// A single direction of the graph: file -> list of related files (all repo-relative).
-type DependencyMap = Record<string, string[]>;
-
-// Both directions, carried together in memory while the codebase is walked.
-interface DependencyMaps {
-  dependencyMap: DependencyMap;
-  dependentMap: DependencyMap;
-}
-
-// The two on-disk filenames inside .agent/.
-const GRAPH_FILES = {
-  dependency: "dependencyMap.json",
-  dependent: "dependentMap.json",
-} as const;
 
 // Extensions we treat as source files to parse, and that we try when resolving an extensionless
 // import specifier.
@@ -88,20 +71,6 @@ const JS_TO_TS_TWINS: Record<string, string[]> = {
 
 // Directories we never descend into while walking.
 const IGNORED_DIRECTORIES = new Set(["node_modules", ".git", "dist", ".agent"]);
-
-// --- small path helpers (keep all .agent/ path construction in this module) ---
-
-function agentDir(repoRoot: string): string {
-  return path.join(repoRoot, ".agent");
-}
-
-function graphFilePaths(repoRoot: string): { dependency: string; dependent: string } {
-  const dir = agentDir(repoRoot);
-  return {
-    dependency: path.join(dir, GRAPH_FILES.dependency),
-    dependent: path.join(dir, GRAPH_FILES.dependent),
-  };
-}
 
 // Absolute path -> repo-relative key with forward slashes (stable across OSes).
 function toRepoRelative(absolutePath: string, repoRoot: string): string {
@@ -349,33 +318,9 @@ function walkAndParse(
 }
 
 /**
- * initializeDependencyGraph: sole responsibility is file I/O — create .agent/ (if needed) and
- * write both graph files initialized to an empty object, guaranteeing they exist after a build.
- */
-function initializeDependencyGraph(repoRoot: string): void {
-  mkdirSync(agentDir(repoRoot), { recursive: true });
-  const paths = graphFilePaths(repoRoot);
-  writeFileSync(paths.dependency, `${JSON.stringify({}, null, 2)}\n`, "utf8");
-  writeFileSync(paths.dependent, `${JSON.stringify({}, null, 2)}\n`, "utf8");
-}
-
-// True only when BOTH graph files already exist in .agent/.
-function dependencyGraphExists(repoRoot: string): boolean {
-  const paths = graphFilePaths(repoRoot);
-  return existsSync(paths.dependency) && existsSync(paths.dependent);
-}
-
-// Persist the populated maps — one write per file, no per-edge disk I/O.
-function writeMaps(repoRoot: string, maps: DependencyMaps): void {
-  const paths = graphFilePaths(repoRoot);
-  writeFileSync(paths.dependency, `${JSON.stringify(maps.dependencyMap, null, 2)}\n`, "utf8");
-  writeFileSync(paths.dependent, `${JSON.stringify(maps.dependentMap, null, 2)}\n`, "utf8");
-}
-
-/**
- * buildDependencyGraph: the single entry point used by the "start" command. Creates the files,
- * builds both maps in memory by walking/parsing the codebase, writes them once, and logs a
- * human-readable success summary.
+ * buildDependencyGraph: the single entry point used by the "start" command. Asks agentState to
+ * create the files, builds both maps in memory by walking/parsing the codebase, persists them once
+ * (again via agentState), and logs a human-readable success summary.
  */
 function buildDependencyGraph(repoRoot: string, config: ConfigSnapshot): void {
   initializeDependencyGraph(repoRoot);
@@ -383,7 +328,7 @@ function buildDependencyGraph(repoRoot: string, config: ConfigSnapshot): void {
   const maps: DependencyMaps = { dependencyMap: {}, dependentMap: {} };
   walkAndParse(repoRoot, repoRoot, config, maps);
 
-  writeMaps(repoRoot, maps);
+  writeDependencyMaps(repoRoot, maps);
 
   const fileCount = Object.keys(maps.dependencyMap).length;
   const edgeCount = Object.values(maps.dependencyMap).reduce(
@@ -393,21 +338,9 @@ function buildDependencyGraph(repoRoot: string, config: ConfigSnapshot): void {
   console.log(
     `Dependency graph built: ${fileCount} source file(s), ${edgeCount} internal import edge(s).`,
   );
-  console.log(
-    `  Written to ${path.join(".agent", GRAPH_FILES.dependency)} and ${path.join(
-      ".agent",
-      GRAPH_FILES.dependent,
-    )}.`,
-  );
+  console.log("  Written to .agent/dependencyMap.json and .agent/dependentMap.json.");
 }
 
-export {
-  addEdge,
-  buildDependencyGraph,
-  dependencyGraphExists,
-  extractImports,
-  initializeDependencyGraph,
-  resolveImport,
-  walkAndParse,
-};
-export type { DependencyMap, DependencyMaps };
+export { addEdge, buildDependencyGraph, extractImports, resolveImport, walkAndParse };
+// dependencyGraphExists lives in the state layer; re-exported here for existing callers/tests.
+export { dependencyGraphExists } from "../state/agentState.js";

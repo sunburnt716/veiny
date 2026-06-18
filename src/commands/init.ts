@@ -1,8 +1,9 @@
 import { execSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import * as path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
+import { writeAgentState } from "../state/agentState.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -143,34 +144,6 @@ async function promptForContext(): Promise<string> {
     ).trim();
   } finally {
     interfaceInstance.close();
-  }
-}
-
-function writeAgentState(
-  repoRoot: string,
-  config: ConfigSnapshot,
-  context: string,
-): void {
-  const agentDirectory = path.join(repoRoot, ".agent");
-  mkdirSync(agentDirectory, { recursive: true });
-
-  writeFileSync(
-    path.join(agentDirectory, "repoInfo.json"),
-    `${JSON.stringify({ repoRoot }, null, 2)}\n`,
-    "utf8",
-  );
-  writeFileSync(
-    path.join(agentDirectory, "configInfo.json"),
-    `${JSON.stringify(config, null, 2)}\n`,
-    "utf8",
-  );
-
-  if (context.trim().length > 0) {
-    writeFileSync(
-      path.join(agentDirectory, "userContext.md"),
-      `${context.trim()}\n`,
-      "utf8",
-    );
   }
 }
 
