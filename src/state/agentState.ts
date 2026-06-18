@@ -18,7 +18,12 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 import type { ConfigSnapshot } from "../commands/init.js";
-import type { DependencyMaps, DependentMap, ReportEntry } from "../core/types.js";
+import type {
+  DependencyMaps,
+  DependentMap,
+  ReportEntry,
+  VerificationEntry,
+} from "../core/types.js";
 
 // Canonical .agent/ filenames — the one place these strings live.
 const AGENT_DIR = ".agent";
@@ -29,6 +34,7 @@ const FILES = {
   dependencyMap: "dependencyMap.json",
   dependentMap: "dependentMap.json",
   report: "report.json",
+  verifications: "verifications.json",
 } as const;
 
 function agentDir(repoRoot: string): string {
@@ -130,10 +136,48 @@ function writeReport(repoRoot: string, report: ReportEntry[]): void {
   writeJson(agentFile(repoRoot, FILES.report), report);
 }
 
+/**
+ * readVerifications: load the accumulated accuracy-feedback log. Returns [] when the file is absent;
+ * a corrupt/non-array file logs a descriptive warning and degrades to [] (consistent with
+ * readDependentMap) rather than crashing the watch loop.
+ */
+function readVerifications(repoRoot: string): VerificationEntry[] {
+  const file = agentFile(repoRoot, FILES.verifications);
+  if (!existsSync(file)) {
+    return [];
+  }
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
+    if (Array.isArray(parsed)) {
+      return parsed as VerificationEntry[];
+    }
+    console.warn(`Warning: ${file} is not a valid verification log; treating it as empty.`);
+    return [];
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`Warning: could not read ${file}; treating it as empty. ${message}`);
+    return [];
+  }
+}
+
+/**
+ * recordVerification: append one accuracy-feedback record to .agent/verifications.json, preserving
+ * prior entries. The verification log is an append-only history of "did Veiny's catches match what
+ * was committed, per the developer".
+ */
+function recordVerification(repoRoot: string, entry: VerificationEntry): void {
+  const entries = readVerifications(repoRoot);
+  entries.push(entry);
+  ensureAgentDir(repoRoot);
+  writeJson(agentFile(repoRoot, FILES.verifications), entries);
+}
+
 export {
   dependencyGraphExists,
   initializeDependencyGraph,
   readDependentMap,
+  readVerifications,
+  recordVerification,
   writeAgentState,
   writeDependencyMaps,
   writeReport,

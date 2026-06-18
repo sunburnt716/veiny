@@ -77,9 +77,34 @@ type ReportEntry =
   | { type: "typeCheck"; data: Diagnostic[] }
   | { type: "blastRadius"; data: BlastRadiusEntry[] };
 
+// --- interactive watch session ---
+
+// Headline counts derived from a report, shown to the user when a staged change is caught.
+interface ReportSummary {
+  errors: number; // typeCheck diagnostics with category "error"
+  warnings: number; // typeCheck diagnostics with category "warning"
+  affectedFiles: number; // unique files in the blast radius (who imports the changed files)
+}
+
+// Result of comparing the files Veiny caught (staged) against the files in a detected commit.
+interface CommitComparison {
+  committedAndCaught: string[]; // caught files that actually landed in the commit
+  caughtNotCommitted: string[]; // caught files that did NOT land in the commit
+  allCaughtWereCommitted: boolean; // true when every caught file appears in the commit
+}
+
+// One accuracy-feedback record, appended to .agent/verifications.json on commit verification.
+interface VerificationEntry {
+  timestamp: string; // ISO-8601
+  caughtFiles: string[]; // repo-relative files Veiny had caught (staged)
+  committedFiles: string[]; // repo-relative files in the detected commit
+  accurate: boolean; // the user's y/n answer
+}
+
 export type {
   BlastRadiusEntry,
   ChangedSymbol,
+  CommitComparison,
   DependencyMap,
   DependencyMaps,
   DependentMap,
@@ -87,5 +112,7 @@ export type {
   FileDiff,
   Hunk,
   ReportEntry,
+  ReportSummary,
   SymbolMap,
+  VerificationEntry,
 };

@@ -1,38 +1,58 @@
 /*
  * watch.ts
  * --------
- * The `watch` command. This file is a little different from the rest of the codebase: its functions
- * are actions taken AFTER a trigger, driven by fs.watch / fs.watchFile rather than a linear call
- * chain.
+ * The `watch` command — now an INTERACTIVE session. This file is a little different from the rest of
+ * the codebase: its functions are actions taken AFTER a trigger, driven by fs.watch / fs.watchFile
+ * rather than a linear call chain.
  *
- * What it does: watches repoRoot/.git/index (the file git rewrites on every `git add`) so we know
- * the moment files are staged, then asks detectStagedCommit what changed and hands the result to the
- * deterministic analysis engine (core/analysis.ts). fs.watch is the low-latency primary; fs.watchFile
- * polls every 1000ms as a backup, because git replaces .git/index atomically on `git add`, which can
- * silently detach a lone fs.watch watcher (and the index may not even exist yet in a fresh repo).
+ * Two things are watched inside .git:
+ *   - .git/index     : rewritten on every `git add` -> a "staged change" was caught. We analyze it
+ *                      (core/analysis.ts), print headline metrics, and prompt the user (keep / quit).
+ *   - .git/logs/HEAD : appended to on every commit -> a "commit" happened. We compare the files we
+ *                      caught (staged) to the files in that commit and ask the developer whether the
+ *                      detection was accurate, recording the answer as feedback.
  *
- * Orchestration only: the heavy analysis logic lives in core/analysis.ts; the shared types live in
- * core/types.ts. This file just turns "the index changed" into a FileDiff[] and triggers analysis.
+ * fs.watch is the low-latency primary; fs.watchFile polls every 1000ms as a backup, because git
+ * replaces these files atomically, which can silently detach a lone fs.watch watcher (and they may
+ * not exist yet in a fresh repo). Events from both sources are debounced and SERIALIZED through one
+ * queue so two prompts can never be open at once. The user can stop any time: `quit` at a prompt, or
+ * Ctrl+C (SIGINT) — both run a single graceful teardown.
+ *
+ * Orchestration only: the heavy analysis lives in core/analysis.ts, the pure session math in
+ * core/watchSession.ts, the shared types in core/types.ts, and all .agent/ I/O in state/agentState.ts.
  */
 
 import { execSync } from "node:child_process";
-import { watch, watchFile, type FSWatcher } from "node:fs";
+import { watch, watchFile, unwatchFile, type FSWatcher } from "node:fs";
 import * as path from "node:path";
 import { stdin, stdout } from "node:process";
 import { createInterface } from "node:readline/promises";
 import { runDiffAnalysis } from "../core/analysis.js";
-import type { FileDiff, Hunk } from "../core/types.js";
+import type { FileDiff, Hunk, VerificationEntry } from "../core/types.js";
+import {
+  compareCaughtToCommitted,
+  summarizeReport,
+} from "../core/watchSession.js";
+import { recordVerification } from "../state/agentState.js";
 import {
   buildDependencyGraph,
   dependencyGraphExists,
 } from "../utils/dependencyGraph.js";
-import { captureConfig, validateGitRepo } from "./init.js";
+import { captureConfig, validateGitRepo, type ConfigSnapshot } from "./init.js";
 
-// Verbosity for watch output. Defaults to "periodic" so we don't spam "Watching for
-// changes" when it isn't useful.
+// Verbosity for the startup message. Defaults to "periodic" so we don't over-announce.
 // TODO: move this into .agent/ config (via src/state) so the user can change it later.
 type WatchVerbosity = "verbose" | "periodic";
 const watchVerbosity: WatchVerbosity = "periodic";
+
+// Running totals for one watch session — shown to the user and recorded as feedback.
+interface WatchSession {
+  catches: number; // staged-change catches this session
+  lastCaughtFiles: string[]; // repo-relative files from the most recent catch (for commit compare)
+  commitsVerified: number;
+  accurateCount: number;
+  inaccurateCount: number;
+}
 
 /**
  * parseHunkHeader: pull the NEW-side range out of a unified-diff hunk header.
@@ -96,8 +116,7 @@ function parseStagedDiff(diffOutput: string): FileDiff[] {
 /**
  * detectStagedCommit: figure out what is staged for commit when the watcher fires. Runs
  * `git diff --cached -U0` once and parses it into FileDiff[] (repo-relative path + new-side hunks),
- * which is exactly the input the analysis engine consumes. Logs a short summary; on failure logs
- * descriptively and returns [].
+ * which is exactly the input the analysis engine consumes. On failure logs descriptively, returns [].
  */
 function detectStagedCommit(repoRoot: string): FileDiff[] {
   let diffOutput: string;
@@ -115,26 +134,39 @@ function detectStagedCommit(repoRoot: string): FileDiff[] {
     return [];
   }
 
-  const diffs = parseStagedDiff(diffOutput);
-
-  if (diffs.length > 0) {
-    console.log(
-      `Detected staged change — ${diffs.length} file(s) staged for commit:`,
-    );
-    for (const diff of diffs) {
-      console.log(`  • ${diff.filePath}`);
-    }
-  } else {
-    console.log(
-      "Index changed, but no text files are currently staged for commit.",
-    );
-  }
-
-  return diffs;
+  return parseStagedDiff(diffOutput);
 }
 
-// Ask the developer a yes/no question on its own readline interface (index.ts has already closed
-// the command-loop interface before runWatch runs, so we own stdin here).
+/**
+ * getCommittedFiles: list the repo-relative files that landed in the most recent commit (HEAD), via
+ * `git diff-tree --no-commit-id --name-only -r HEAD`. On failure logs descriptively and returns [].
+ */
+function getCommittedFiles(repoRoot: string): string[] {
+  let output: string;
+  try {
+    // --root makes the very first (parentless) commit list its full tree instead of nothing;
+    // it has no effect on ordinary commits, which diff against their parent as usual.
+    output = execSync("git diff-tree --no-commit-id --name-only -r --root HEAD", {
+      cwd: repoRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(
+      `Error: failed to read committed files via 'git diff-tree'. ${message}`,
+    );
+    return [];
+  }
+
+  return output
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+}
+
+// Ask a single yes/no question on its own short-lived readline interface. Used only for the startup
+// graph-build prompt, before the long-lived session interface is created.
 async function promptYesNo(questionText: string): Promise<boolean> {
   const rl = createInterface({ input: stdin, output: stdout });
   try {
@@ -153,8 +185,7 @@ async function runWatch(): Promise<void> {
     return;
   }
 
-  // The analysis engine needs the build config (for the future symbol pass) and the dependency
-  // graph (for blast radius). Capture config now and ensure the graph exists.
+  // The analysis engine needs the build config and the dependency graph (for blast radius).
   const config = captureConfig(repoRoot);
 
   if (!dependencyGraphExists(repoRoot)) {
@@ -170,58 +201,236 @@ async function runWatch(): Promise<void> {
     }
   }
 
-  const indexPath = path.join(repoRoot, ".git", "index");
+  // The interactive loop resolves only when the user quits (command or SIGINT), so main() blocks on
+  // `await runWatch()` until then.
+  await watchInteractively(repoRoot, config);
+}
 
-  // Debounce the two watch sources (fs.watch + fs.watchFile) through a single handler so a single
-  // `git add` doesn't trigger duplicate analysis passes. Analysis is wrapped in try/catch so a
-  // transient compiler/config failure logs but never kills the long-running watch loop.
-  let debounceTimer: ReturnType<typeof setTimeout> | null = null;
-  const onIndexChange = (): void => {
-    if (debounceTimer) {
-      clearTimeout(debounceTimer);
-    }
-    debounceTimer = setTimeout(() => {
-      const diffs = detectStagedCommit(repoRoot);
-      if (diffs.length === 0) {
+/**
+ * watchInteractively: the long-running session. Sets up the two watchers and a single readline
+ * interface, serializes events so prompts never overlap, and resolves when the user quits.
+ */
+function watchInteractively(
+  repoRoot: string,
+  config: ConfigSnapshot,
+): Promise<void> {
+  const session: WatchSession = {
+    catches: 0,
+    lastCaughtFiles: [],
+    commitsVerified: 0,
+    accurateCount: 0,
+    inaccurateCount: 0,
+  };
+
+  const indexPath = path.join(repoRoot, ".git", "index");
+  const headLogPath = path.join(repoRoot, ".git", "logs", "HEAD");
+
+  return new Promise<void>((resolve) => {
+    let stopped = false;
+    let indexDebounce: ReturnType<typeof setTimeout> | null = null;
+    let headDebounce: ReturnType<typeof setTimeout> | null = null;
+    let indexWatcher: FSWatcher | null = null;
+    let headWatcher: FSWatcher | null = null;
+    // Serializes async handlers so only one prompt is ever open at a time.
+    let queue: Promise<void> = Promise.resolve();
+
+    const rl = createInterface({ input: stdin, output: stdout });
+
+    // Single graceful teardown, shared by the `quit` command and Ctrl+C. Idempotent via `stopped`.
+    const stopWatching = (): void => {
+      if (stopped) {
         return;
       }
+      stopped = true;
+      if (indexDebounce) {
+        clearTimeout(indexDebounce);
+      }
+      if (headDebounce) {
+        clearTimeout(headDebounce);
+      }
+      indexWatcher?.close();
+      headWatcher?.close();
+      unwatchFile(indexPath);
+      unwatchFile(headLogPath);
+      process.removeListener("SIGINT", onSigint);
+      rl.close();
+      console.log("\nGoodbye.");
+      resolve();
+    };
+
+    const onSigint = (): void => stopWatching();
+    rl.on("SIGINT", onSigint);
+    process.on("SIGINT", onSigint);
+
+    // Ask a question on the session interface. Returns "" if the session has stopped or the
+    // interface closed mid-question (e.g. Ctrl+C during a prompt) — that is expected on shutdown,
+    // not an error to surface; any other failure is logged.
+    const ask = async (questionText: string): Promise<string> => {
+      if (stopped) {
+        return "";
+      }
       try {
-        runDiffAnalysis(diffs, repoRoot, config);
-        console.log("Analysis written to .agent/report.json.");
+        return (await rl.question(questionText)).trim().toLowerCase();
+      } catch (error) {
+        if (!stopped) {
+          const message = error instanceof Error ? error.message : String(error);
+          console.error(`Error reading input: ${message}`);
+        }
+        return "";
+      }
+    };
+
+    // Handle a staged change: analyze it, show headline metrics, and offer keep/quit.
+    const handleStagedCatch = async (): Promise<void> => {
+      if (stopped) {
+        return;
+      }
+      const diffs = detectStagedCommit(repoRoot);
+      if (diffs.length === 0) {
+        // The index changed but nothing is staged (e.g. right after a commit clears it) — ignore.
+        return;
+      }
+
+      session.catches += 1;
+      session.lastCaughtFiles = diffs.map((diff) => diff.filePath);
+
+      let metrics: string;
+      try {
+        const report = runDiffAnalysis(diffs, repoRoot, config);
+        const summary = summarizeReport(report);
+        metrics = `${diffs.length} file(s) caught · ${summary.errors} error(s) · ${summary.warnings} warning(s) · ${summary.affectedFiles} affected file(s)`;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         console.error(`Error: analysis failed for this change. ${message}`);
+        metrics = `${diffs.length} file(s) caught · analysis failed`;
       }
-    }, 100);
-  };
 
-  // Backup poll every 1000ms. watchFile tolerates the index not existing yet (a brand-new repo has
-  // no .git/index until the first `git add`) and fires once it appears, so it is set up first and
-  // unconditionally as the guaranteed safety net.
-  watchFile(indexPath, { interval: 1000 }, onIndexChange);
+      console.log(`\n[caught] ${metrics}`);
+      for (const file of session.lastCaughtFiles) {
+        console.log(`  • ${file}`);
+      }
 
-  // Primary watcher: lower latency than the poll, but fs.watch throws if .git/index does not exist
-  // yet and can be broken by git's atomic index replacement. If it cannot attach we log a warning
-  // and keep going — the 1000ms poll above still covers us.
-  try {
-    const watcher: FSWatcher = watch(indexPath, onIndexChange);
-    watcher.on("error", (error: Error) => {
-      console.error(
-        `Warning: live watcher on ${indexPath} stopped. ${error.message} (still polling every 1000ms)`,
+      const answer = await ask("[Enter] keep watching · type 'quit' to stop: ");
+      if (answer === "quit" || answer === "q") {
+        stopWatching();
+      }
+    };
+
+    // Handle a commit: compare what we caught to what was committed and record accuracy feedback.
+    const handleCommit = async (): Promise<void> => {
+      if (stopped) {
+        return;
+      }
+      if (session.lastCaughtFiles.length === 0) {
+        // Nothing was caught this session, so there is nothing to verify against the commit.
+        return;
+      }
+      const committed = getCommittedFiles(repoRoot);
+      if (committed.length === 0) {
+        return;
+      }
+
+      const comparison = compareCaughtToCommitted(
+        session.lastCaughtFiles,
+        committed,
       );
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error(
-      `Warning: could not attach a live watcher to ${indexPath}. ${message} (falling back to the 1000ms poll)`,
-    );
-  }
+      console.log(
+        `\n[commit] ${comparison.committedAndCaught.length} of ${session.lastCaughtFiles.length} caught file(s) are in this commit.`,
+      );
+      if (comparison.committedAndCaught.length > 0) {
+        console.log(`  matched: ${comparison.committedAndCaught.join(", ")}`);
+      }
 
-  if (watchVerbosity === "periodic") {
-    console.log("Watching for changes periodically...");
-  } else {
-    console.log("Watching for changes...");
-  }
+      const answer = await ask(
+        "Was Veiny's detection accurate for this commit? (y/n, or 'quit'): ",
+      );
+      if (answer === "quit" || answer === "q") {
+        stopWatching();
+        return;
+      }
+
+      // Treat y/yes as accurate; anything else is "not accurate" for this simple feedback signal.
+      const accurate = answer === "y" || answer === "yes";
+      session.commitsVerified += 1;
+      if (accurate) {
+        session.accurateCount += 1;
+      } else {
+        session.inaccurateCount += 1;
+      }
+
+      const entry: VerificationEntry = {
+        timestamp: new Date().toISOString(),
+        caughtFiles: session.lastCaughtFiles,
+        committedFiles: committed,
+        accurate,
+      };
+      recordVerification(repoRoot, entry);
+      console.log(
+        `Recorded. Session accuracy: ${session.accurateCount} accurate / ${session.inaccurateCount} not.`,
+      );
+    };
+
+    // Append a handler to the serialization queue, logging (never swallowing) any failure.
+    const enqueue = (handler: () => Promise<void>): void => {
+      queue = queue.then(handler).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`Error in watch handler: ${message}`);
+      });
+    };
+
+    const onIndexChange = (): void => {
+      if (stopped) {
+        return;
+      }
+      if (indexDebounce) {
+        clearTimeout(indexDebounce);
+      }
+      indexDebounce = setTimeout(() => enqueue(handleStagedCatch), 100);
+    };
+
+    const onHeadChange = (): void => {
+      if (stopped) {
+        return;
+      }
+      if (headDebounce) {
+        clearTimeout(headDebounce);
+      }
+      headDebounce = setTimeout(() => enqueue(handleCommit), 100);
+    };
+
+    // Attach watchers to a target: fs.watchFile (unconditional poll, tolerates a missing file) plus a
+    // best-effort fs.watch (lower latency; a failure is a warning, not fatal — the poll still covers).
+    const attachWatchers = (
+      target: string,
+      onChange: () => void,
+    ): FSWatcher | null => {
+      watchFile(target, { interval: 1000 }, onChange);
+      try {
+        const watcher = watch(target, onChange);
+        watcher.on("error", (error: Error) => {
+          console.error(
+            `Warning: live watcher on ${target} stopped. ${error.message} (still polling every 1000ms)`,
+          );
+        });
+        return watcher;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(
+          `Warning: could not attach a live watcher to ${target}. ${message} (falling back to the 1000ms poll)`,
+        );
+        return null;
+      }
+    };
+
+    indexWatcher = attachWatchers(indexPath, onIndexChange);
+    headWatcher = attachWatchers(headLogPath, onHeadChange);
+
+    if (watchVerbosity === "periodic") {
+      console.log("Watching for changes periodically... (Ctrl+C to quit)");
+    } else {
+      console.log("Watching for changes... (Ctrl+C to quit)");
+    }
+  });
 }
 
-export { detectStagedCommit, runWatch };
+export { detectStagedCommit, getCommittedFiles, runWatch };

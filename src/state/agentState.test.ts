@@ -12,10 +12,16 @@ import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { ConfigSnapshot } from "../commands/init.js";
-import type { DependentMap, ReportEntry } from "../core/types.js";
+import type {
+  DependentMap,
+  ReportEntry,
+  VerificationEntry,
+} from "../core/types.js";
 import {
   dependencyGraphExists,
   readDependentMap,
+  readVerifications,
+  recordVerification,
   writeAgentState,
   writeDependencyMaps,
   writeReport,
@@ -178,5 +184,75 @@ describe("dependencyGraphExists", () => {
     });
 
     expect(dependencyGraphExists(repoRoot)).toBe(true);
+  });
+});
+
+describe("recordVerification", () => {
+  it("appends across multiple calls, preserving order", () => {
+    const repoRoot = makeTempDir();
+
+    const first: VerificationEntry = {
+      timestamp: "2026-01-01T00:00:00.000Z",
+      caughtFiles: ["src/a.ts"],
+      committedFiles: ["src/a.ts"],
+      accurate: true,
+    };
+    const second: VerificationEntry = {
+      timestamp: "2026-01-02T00:00:00.000Z",
+      caughtFiles: ["src/b.ts", "src/c.ts"],
+      committedFiles: ["src/b.ts"],
+      accurate: false,
+    };
+
+    recordVerification(repoRoot, first);
+    recordVerification(repoRoot, second);
+
+    // Read back through the public reader: both entries, in call order.
+    expect(readVerifications(repoRoot)).toEqual<VerificationEntry[]>([
+      first,
+      second,
+    ]);
+
+    // And the on-disk file is a JSON array of those two entries.
+    const onDisk: unknown = JSON.parse(
+      readFileSync(
+        path.join(repoRoot, ".agent", "verifications.json"),
+        "utf8",
+      ),
+    );
+    expect(onDisk).toEqual([first, second]);
+  });
+});
+
+describe("readVerifications", () => {
+  it("returns [] when the file is absent", () => {
+    const repoRoot = makeTempDir();
+
+    expect(readVerifications(repoRoot)).toEqual([]);
+  });
+
+  it("degrades to [] for corrupt JSON without throwing", () => {
+    const repoRoot = makeTempDir();
+    mkdirSync(path.join(repoRoot, ".agent"), { recursive: true });
+    writeFileSync(
+      path.join(repoRoot, ".agent", "verifications.json"),
+      "{ not valid json",
+      "utf8",
+    );
+
+    expect(() => readVerifications(repoRoot)).not.toThrow();
+    expect(readVerifications(repoRoot)).toEqual([]);
+  });
+
+  it("degrades to [] when the file parses to a non-array value", () => {
+    const repoRoot = makeTempDir();
+    mkdirSync(path.join(repoRoot, ".agent"), { recursive: true });
+    writeFileSync(
+      path.join(repoRoot, ".agent", "verifications.json"),
+      JSON.stringify({ not: "an array" }),
+      "utf8",
+    );
+
+    expect(readVerifications(repoRoot)).toEqual([]);
   });
 });

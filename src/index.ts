@@ -32,7 +32,10 @@ async function main(): Promise<void> {
         "\nVeiny parses your project into a dependency graph and analyzes staged diffs for heuristic issues before commits land.",
       );
       console.log(
-        "Commands: start (initialize agent state), watch (run analysis/watch mode), quit (exit).\n",
+        "Commands: start (initialize agent state + build the dependency graph), watch (interactive analysis), quit (exit).",
+      );
+      console.log(
+        "In watch mode Veiny prompts you with metrics whenever it catches staged changes, asks you to verify accuracy after each commit, and stops on 'quit' or Ctrl+C.\n",
       );
     }
     startupSequence = true;
