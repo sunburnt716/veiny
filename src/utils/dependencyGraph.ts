@@ -29,11 +29,20 @@ import type {
 import { existsSync, readdirSync, readFileSync, statSync, type Dirent } from "node:fs";
 import * as path from "node:path";
 import type { ConfigSnapshot } from "../commands/init.js";
-import type { DependencyMap, DependencyMaps } from "../core/types.js";
+import type { DependencyMap, DependencyMaps, ImportEdge } from "../core/types.js";
 import {
   initializeDependencyGraph,
   writeDependencyMaps,
+  writeImports,
 } from "../state/agentState.js";
+
+// One import statement's raw result: the specifier string plus the symbols it pulls across the edge.
+// "all" means the whole module may be used (namespace/default/dynamic/require/export *); a named list
+// means exactly those exported names cross. Resolution of the specifier to a file happens later.
+interface RawImport {
+  specifier: string;
+  symbols: string[];
+}
 
 /*
  * @babel/traverse is published as CommonJS. Imported under ESM the namespace object is what we
@@ -87,7 +96,7 @@ function isSourceFile(filename: string): boolean {
  * — resolution to repo-relative file paths happens later in resolveImport(). A read/parse failure
  * on one file logs a warning and returns [] so it can never abort the whole walk.
  */
-function extractImports(filepath: string): string[] {
+function extractImports(filepath: string): RawImport[] {
   let sourceCode: string;
   try {
     sourceCode = readFileSync(filepath, "utf8");
@@ -110,24 +119,56 @@ function extractImports(filepath: string): string[] {
     return [];
   }
 
-  const specifiers: string[] = [];
+  const imports: RawImport[] = [];
 
   traverse(ast, {
-    // `import x from "y"` / bare `import "y"`
+    // `import def, { a, b as c }, * as ns from "y"` / bare `import "y"`. We classify each specifier:
+    // named → the ORIGINAL exported name (the part before `as`, which Babel exposes directly);
+    // default → "default"; namespace (`* as ns`) → "all". A side-effect-only import has no
+    // specifiers, so no named symbols cross (symbols stays []).
     ImportDeclaration(nodePath: NodePath<ImportDeclaration>) {
-      specifiers.push(nodePath.node.source.value);
-    },
-    // `export { x } from "y"` (only when there is a source to re-export from)
-    ExportNamedDeclaration(nodePath: NodePath<ExportNamedDeclaration>) {
-      if (nodePath.node.source) {
-        specifiers.push(nodePath.node.source.value);
+      const symbols: string[] = [];
+      for (const spec of nodePath.node.specifiers) {
+        if (spec.type === "ImportSpecifier") {
+          // spec.imported is the name in the SOURCE module (before any local `as` alias).
+          symbols.push(
+            spec.imported.type === "Identifier"
+              ? spec.imported.name
+              : spec.imported.value,
+          );
+        } else if (spec.type === "ImportDefaultSpecifier") {
+          symbols.push("default");
+        } else {
+          // ImportNamespaceSpecifier — the whole module surface may be used.
+          symbols.push("all");
+        }
       }
+      imports.push({ specifier: nodePath.node.source.value, symbols });
     },
-    // `export * from "y"`
+    // `export { x as y } from "z"` — only when there is a source to re-export from. The symbol that
+    // crosses the edge from z is the LOCAL name (the name as exported by z), before any rename.
+    ExportNamedDeclaration(nodePath: NodePath<ExportNamedDeclaration>) {
+      const source = nodePath.node.source;
+      if (!source) {
+        return;
+      }
+      const symbols: string[] = [];
+      for (const spec of nodePath.node.specifiers) {
+        if (spec.type === "ExportSpecifier") {
+          // ExportSpecifier.local is always an Identifier (the name as exported by the source).
+          symbols.push(spec.local.name);
+        } else {
+          // ExportNamespaceSpecifier (`export * as ns from`) — whole module surface.
+          symbols.push("all");
+        }
+      }
+      imports.push({ specifier: source.value, symbols });
+    },
+    // `export * from "y"` — re-exports everything, so the whole surface crosses.
     ExportAllDeclaration(nodePath: NodePath<ExportAllDeclaration>) {
-      specifiers.push(nodePath.node.source.value);
+      imports.push({ specifier: nodePath.node.source.value, symbols: ["all"] });
     },
-    // dynamic `import("y")` and CommonJS `require("y")`
+    // dynamic `import("y")` and CommonJS `require("y")` — what's used can't be known statically.
     CallExpression(nodePath: NodePath<CallExpression>) {
       const callee = nodePath.node.callee;
       const isDynamicImport = callee.type === "Import";
@@ -137,12 +178,21 @@ function extractImports(filepath: string): string[] {
       }
       const firstArg = nodePath.node.arguments[0];
       if (firstArg && firstArg.type === "StringLiteral") {
-        specifiers.push(firstArg.value);
+        imports.push({ specifier: firstArg.value, symbols: ["all"] });
       }
     },
   });
 
-  return specifiers;
+  return imports;
+}
+
+// Union two symbol lists for the same edge. "all" dominates: if either side may use the whole
+// module, the merged seam is ["all"]; otherwise it's the de-duplicated union of named symbols.
+function mergeSymbols(existing: string[], incoming: string[]): string[] {
+  if (existing.includes("all") || incoming.includes("all")) {
+    return ["all"];
+  }
+  return [...new Set([...existing, ...incoming])];
 }
 
 /**
@@ -273,7 +323,8 @@ function ensureNode(maps: DependencyMaps, file: string): void {
 
 /**
  * walkAndParse: recurse from `dir`, skipping ignored directories, and for every source file
- * extract its imports, resolve the repo-internal ones, and record edges into `maps`. A directory
+ * extract its imports, resolve the repo-internal ones, and record edges into `maps` (file-level) and
+ * `edges` (the symbol-bearing import seams, keyed/merged per importer→imported pair). A directory
  * that can't be read logs a warning and is skipped rather than aborting the build.
  */
 function walkAndParse(
@@ -281,6 +332,7 @@ function walkAndParse(
   repoRoot: string,
   config: ConfigSnapshot,
   maps: DependencyMaps,
+  edges: Map<string, ImportEdge>,
 ): void {
   let entries: Dirent[];
   try {
@@ -296,7 +348,7 @@ function walkAndParse(
 
     if (entry.isDirectory()) {
       if (!IGNORED_DIRECTORIES.has(entry.name)) {
-        walkAndParse(entryPath, repoRoot, config, maps);
+        walkAndParse(entryPath, repoRoot, config, maps, edges);
       }
       continue;
     }
@@ -308,10 +360,30 @@ function walkAndParse(
     const importerRel = toRepoRelative(entryPath, repoRoot);
     ensureNode(maps, importerRel);
 
-    for (const specifier of extractImports(entryPath)) {
-      const importedRel = resolveImport(specifier, entryPath, repoRoot, config);
-      if (importedRel !== null) {
-        addEdge(maps, importerRel, importedRel);
+    for (const rawImport of extractImports(entryPath)) {
+      const importedRel = resolveImport(
+        rawImport.specifier,
+        entryPath,
+        repoRoot,
+        config,
+      );
+      if (importedRel === null) {
+        continue;
+      }
+      addEdge(maps, importerRel, importedRel);
+
+      // Accumulate the symbol-bearing seam, merging when the same importer→imported pair appears
+      // more than once (e.g. a default import and a named import from the same module).
+      const key = `${importerRel} ${importedRel}`;
+      const existing = edges.get(key);
+      if (existing) {
+        existing.symbols = mergeSymbols(existing.symbols, rawImport.symbols);
+      } else {
+        edges.set(key, {
+          importer: importerRel,
+          imported: importedRel,
+          symbols: [...rawImport.symbols],
+        });
       }
     }
   }
@@ -326,9 +398,11 @@ function buildDependencyGraph(repoRoot: string, config: ConfigSnapshot): void {
   initializeDependencyGraph(repoRoot);
 
   const maps: DependencyMaps = { dependencyMap: {}, dependentMap: {} };
-  walkAndParse(repoRoot, repoRoot, config, maps);
+  const edges = new Map<string, ImportEdge>();
+  walkAndParse(repoRoot, repoRoot, config, maps, edges);
 
   writeDependencyMaps(repoRoot, maps);
+  writeImports(repoRoot, [...edges.values()]);
 
   const fileCount = Object.keys(maps.dependencyMap).length;
   const edgeCount = Object.values(maps.dependencyMap).reduce(
@@ -338,7 +412,9 @@ function buildDependencyGraph(repoRoot: string, config: ConfigSnapshot): void {
   console.log(
     `Dependency graph built: ${fileCount} source file(s), ${edgeCount} internal import edge(s).`,
   );
-  console.log("  Written to .agent/dependencyMap.json and .agent/dependentMap.json.");
+  console.log(
+    "  Written to .agent/dependencyMap.json, .agent/dependentMap.json, and .agent/imports.json.",
+  );
 }
 
 export { addEdge, buildDependencyGraph, extractImports, resolveImport, walkAndParse };

@@ -12,6 +12,7 @@ import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { ConfigSnapshot } from "../commands/init.js";
+import type { ImportEdge } from "../core/types.js";
 import {
   buildDependencyGraph,
   dependencyGraphExists,
@@ -50,6 +51,16 @@ function readMap(repoRoot: string, file: string): Record<string, string[]> {
   return JSON.parse(readFileSync(path.join(repoRoot, ".agent", file), "utf8"));
 }
 
+function readImportsFile(repoRoot: string): ImportEdge[] {
+  const parsed: unknown = JSON.parse(
+    readFileSync(path.join(repoRoot, ".agent", "imports.json"), "utf8"),
+  );
+  if (!Array.isArray(parsed)) {
+    throw new Error(`expected imports.json to be an array, got: ${JSON.stringify(parsed)}`);
+  }
+  return parsed as ImportEdge[];
+}
+
 afterEach(() => {
   while (tempDirs.length > 0) {
     const dir = tempDirs.pop();
@@ -59,8 +70,23 @@ afterEach(() => {
   }
 });
 
+// Find the captured symbols for a given specifier among the RawImport[] results. Throws (rather
+// than returning undefined) so a missing specifier is a clear test failure, not a silent skip.
+function symbolsFor(
+  imports: ReturnType<typeof extractImports>,
+  specifier: string,
+): string[] {
+  const match = imports.find((i) => i.specifier === specifier);
+  if (!match) {
+    throw new Error(
+      `expected an import for "${specifier}", got: ${JSON.stringify(imports)}`,
+    );
+  }
+  return match.symbols;
+}
+
 describe("extractImports", () => {
-  it("captures static imports, re-exports, dynamic imports, and require calls", () => {
+  it("captures the specifier of static imports, re-exports, dynamic imports, and require calls", () => {
     const dir = makeTempDir();
     const file = write(
       dir,
@@ -75,11 +101,40 @@ describe("extractImports", () => {
       ].join("\n"),
     );
 
-    const specifiers = extractImports(file).sort();
+    // extractImports now returns RawImport[] ({ specifier, symbols }); assert on the specifier set.
+    const specifiers = extractImports(file)
+      .map((i) => i.specifier)
+      .sort();
 
     expect(specifiers).toEqual(
       ["./mod-a", "./mod-b", "./mod-c", "./mod-d", "./mod-e", "./mod-f"].sort(),
     );
+  });
+
+  it("captures the symbols crossing each kind of edge", () => {
+    const dir = makeTempDir();
+    const file = write(
+      dir,
+      "symbols.ts",
+      [
+        'import def from "./a";', // default import -> ["default"]
+        'import { foo as bar } from "./b";', // named alias -> ORIGINAL name ["foo"]
+        'import * as ns from "./c";', // namespace import -> ["all"]
+        'export * from "./d";', // re-export all -> ["all"]
+        'const e = await import("./e");', // dynamic import -> ["all"]
+        'const f = require("./f");', // require -> ["all"]
+      ].join("\n"),
+    );
+
+    const imports = extractImports(file);
+
+    expect(symbolsFor(imports, "./a")).toEqual(["default"]);
+    // The original exported name (before the `as` alias), not the local alias "bar".
+    expect(symbolsFor(imports, "./b")).toEqual(["foo"]);
+    expect(symbolsFor(imports, "./c")).toEqual(["all"]);
+    expect(symbolsFor(imports, "./d")).toEqual(["all"]);
+    expect(symbolsFor(imports, "./e")).toEqual(["all"]);
+    expect(symbolsFor(imports, "./f")).toEqual(["all"]);
   });
 
   it("returns an empty array for a file that fails to parse", () => {
@@ -159,6 +214,23 @@ describe("buildDependencyGraph", () => {
     // node_modules content excluded entirely.
     const allKeys = [...Object.keys(dependencyMap), ...Object.keys(dependentMap)];
     expect(allKeys.some((key) => key.includes("node_modules"))).toBe(false);
+  });
+
+  it("writes .agent/imports.json as an ImportEdge[] carrying the symbols crossing each edge", () => {
+    const repoRoot = makeTempDir();
+    write(repoRoot, "a.ts", 'import { thing } from "./b";\nexport const a = 1;');
+    write(repoRoot, "b.ts", "export const thing = 2;");
+
+    buildDependencyGraph(repoRoot, emptyConfig());
+
+    const edges = readImportsFile(repoRoot);
+
+    // a.ts imports the named symbol `thing` from b.ts -> exactly one seam carrying ["thing"].
+    expect(edges).toContainEqual<ImportEdge>({
+      importer: "a.ts",
+      imported: "b.ts",
+      symbols: ["thing"],
+    });
   });
 });
 

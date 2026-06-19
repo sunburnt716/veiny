@@ -90,6 +90,11 @@ async function main(): Promise<void> {
         if (shouldBuild) {
           buildDependencyGraph(repoRoot, config);
         }
+
+        // `start` flows straight into watch mode: once the agent state and dependency graph are
+        // ready, begin watching for staged changes without making the user issue a second command.
+        console.log("\nEntering watch mode...\n");
+        await runWatch();
         return;
       }
 

@@ -90,6 +90,37 @@ describe("detectStagedCommit", () => {
     expect(modDiff.hunks.length).toBeGreaterThanOrEqual(1);
     // With -U0, the changed line 2 is reported as a single new-side line at startLine 2.
     expect(modDiff.hunks).toContainEqual({ startLine: 2, lineCount: 1 });
+
+    // The actual changed-line content is captured (without the leading +/-): the new line lands in
+    // additions and the replaced old line lands in deletions.
+    expect(modDiff.additions).toContain("export const two = 22;");
+    expect(modDiff.deletions).toContain("export const two = 2;");
+  });
+
+  it("populates additions from a real staged edit (added line, no leading +)", () => {
+    const dir = makeTempGitRepo();
+    // Baseline two lines, committed, then add a third line and stage it.
+    const baseline = ["export const one = 1;", "export const two = 2;", ""].join("\n");
+    writeFileSync(path.join(dir, "grow.ts"), baseline, "utf8");
+    execSync("git add grow.ts", { cwd: dir, stdio: "ignore" });
+    execSync("git commit -m baseline", { cwd: dir, stdio: "ignore" });
+
+    const edited = [
+      "export const one = 1;",
+      "export const two = 2;",
+      "export const three = 3;",
+      "",
+    ].join("\n");
+    writeFileSync(path.join(dir, "grow.ts"), edited, "utf8");
+    execSync("git add grow.ts", { cwd: dir, stdio: "ignore" });
+
+    const diffs = detectStagedCommit(dir);
+
+    const growDiff = findDiff(diffs, "grow.ts");
+    // The newly added line appears in additions verbatim (no leading "+").
+    expect(growDiff.additions).toContain("export const three = 3;");
+    // A pure addition contributes no deletions.
+    expect(growDiff.deletions).toEqual([]);
   });
 
   it("returns an empty array when nothing is staged", () => {

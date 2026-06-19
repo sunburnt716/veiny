@@ -28,12 +28,29 @@ import * as path from "node:path";
 import { stdin, stdout } from "node:process";
 import { createInterface } from "node:readline/promises";
 import { runDiffAnalysis } from "../core/analysis.js";
-import type { FileDiff, Hunk, VerificationEntry } from "../core/types.js";
+import type {
+  BlastRadiusEntry,
+  FileDiff,
+  Hunk,
+  ReportEntry,
+  VerificationEntry,
+} from "../core/types.js";
 import {
   compareCaughtToCommitted,
   summarizeReport,
 } from "../core/watchSession.js";
-import { recordVerification } from "../state/agentState.js";
+import { runHeuristicAnalysis } from "../llm/analyze.js";
+import { getProvider } from "../llm/client.js";
+import type { AnalysisContext } from "../llm/provider.js";
+import { formatReportMarkdown, reportToTerminal } from "../llm/report.js";
+import { loadApiKey } from "../state/credentials.js";
+import { readLLMConfig } from "../state/llmConfig.js";
+import {
+  readImports,
+  readUserContext,
+  recordVerification,
+  writeHeuristicReport,
+} from "../state/agentState.js";
 import {
   buildDependencyGraph,
   dependencyGraphExists,
@@ -80,10 +97,14 @@ function stripDiffPrefix(diffPath: string): string {
 
 /**
  * parseStagedDiff: turn `git diff --cached -U0` output into FileDiff[]. We read the new-side path
- * from each `+++ b/<path>` line (skipping `+++ /dev/null` deletions, which can't be type-checked)
- * and collect every following `@@` hunk's new-side range until the next file. Binary / mode-only
- * staged changes have no textual hunks and simply don't appear here — the analysis only cares about
- * text source files.
+ * from each `+++ b/<path>` line (skipping `+++ /dev/null` deletions, which can't be type-checked),
+ * collect every following `@@` hunk's new-side range, and capture the actual changed lines
+ * (`+`/`-` content, without the leading marker) into `additions`/`deletions` so the LLM layer has
+ * real diff text to reason about. Binary / mode-only staged changes have no textual hunks and simply
+ * don't appear here — the analysis only cares about text source files.
+ *
+ * The `---`/`+++` header lines are skipped explicitly so they're never mistaken for content; every
+ * other line beginning with `+` or `-` inside a hunk is a changed line.
  */
 function parseStagedDiff(diffOutput: string): FileDiff[] {
   const diffsByPath = new Map<string, FileDiff>();
@@ -97,16 +118,33 @@ function parseStagedDiff(diffOutput: string): FileDiff[] {
         continue;
       }
       const filePath = stripDiffPrefix(target);
-      current = { filePath, hunks: [] };
+      current = { filePath, hunks: [], additions: [], deletions: [] };
       diffsByPath.set(filePath, current);
       continue;
     }
 
-    if (line.startsWith("@@") && current) {
+    // The old-side header — skip so it isn't counted as a deletion line.
+    if (line.startsWith("--- ")) {
+      continue;
+    }
+
+    if (!current) {
+      continue;
+    }
+
+    if (line.startsWith("@@")) {
       const hunk = parseHunkHeader(line);
       if (hunk) {
         current.hunks.push(hunk);
       }
+      continue;
+    }
+
+    // Inside a hunk: capture changed-line content without the leading marker.
+    if (line.startsWith("+")) {
+      current.additions.push(line.slice(1));
+    } else if (line.startsWith("-")) {
+      current.deletions.push(line.slice(1));
     }
   }
 
@@ -280,7 +318,50 @@ function watchInteractively(
       }
     };
 
-    // Handle a staged change: analyze it, show headline metrics, and offer keep/quit.
+    // Optional, gated LLM heuristic step. Runs only when the developer opted in (llmConfig.enabled)
+    // AND a key is available (non-prompting lookup). It feeds Veiny's deterministic facts INTO the
+    // model — diff content, blast radius, import seams, project context — and asks for judgment only.
+    // Any failure (network, parse, etc.) is logged but never aborts the watch loop; if disabled or no
+    // key, it returns silently and watch behaves exactly as before.
+    const runHeuristicStep = async (
+      diffs: FileDiff[],
+      report: ReportEntry[],
+    ): Promise<void> => {
+      const llmConfig = readLLMConfig(repoRoot);
+      const apiKey = loadApiKey(repoRoot);
+      if (!llmConfig?.enabled || !apiKey) {
+        return;
+      }
+      try {
+        const blastEntry = report.find((entry) => entry.type === "blastRadius");
+        const blastRadius: BlastRadiusEntry[] =
+          blastEntry && blastEntry.type === "blastRadius" ? blastEntry.data : [];
+        const ctx: AnalysisContext = {
+          userContext: readUserContext(repoRoot),
+          changedFiles: diffs,
+          blastRadius,
+          imports: readImports(repoRoot),
+        };
+        const provider = getProvider(llmConfig, apiKey);
+        const result = await runHeuristicAnalysis(ctx, provider);
+        reportToTerminal(result);
+
+        const save = await ask("Save this report? (y/n): ");
+        if (save === "y" || save === "yes") {
+          const reportPath = writeHeuristicReport(
+            repoRoot,
+            formatReportMarkdown(result),
+          );
+          console.log(`Report saved to ${reportPath}`);
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`Error: LLM analysis failed for this change. ${message}`);
+      }
+    };
+
+    // Handle a staged change: analyze it, show headline metrics, run the optional LLM step, offer
+    // keep/quit.
     const handleStagedCatch = async (): Promise<void> => {
       if (stopped) {
         return;
@@ -294,9 +375,12 @@ function watchInteractively(
       session.catches += 1;
       session.lastCaughtFiles = diffs.map((diff) => diff.filePath);
 
+      // Capture the deterministic report so the LLM step can reuse its blast radius. Stays null if
+      // analysis throws, in which case the LLM step is skipped (it has no facts to feed the model).
+      let report: ReportEntry[] | null = null;
       let metrics: string;
       try {
-        const report = runDiffAnalysis(diffs, repoRoot, config);
+        report = runDiffAnalysis(diffs, repoRoot, config);
         const summary = summarizeReport(report);
         metrics = `${diffs.length} file(s) caught · ${summary.errors} error(s) · ${summary.warnings} warning(s) · ${summary.affectedFiles} affected file(s)`;
       } catch (error) {
@@ -308,6 +392,10 @@ function watchInteractively(
       console.log(`\n[caught] ${metrics}`);
       for (const file of session.lastCaughtFiles) {
         console.log(`  • ${file}`);
+      }
+
+      if (report !== null) {
+        await runHeuristicStep(diffs, report);
       }
 
       const answer = await ask("[Enter] keep watching · type 'quit' to stop: ");

@@ -21,18 +21,21 @@ import type { ConfigSnapshot } from "../commands/init.js";
 import type {
   DependencyMaps,
   DependentMap,
+  ImportEdge,
   ReportEntry,
   VerificationEntry,
 } from "../core/types.js";
 
 // Canonical .agent/ filenames — the one place these strings live.
 const AGENT_DIR = ".agent";
+const REPORTS_DIR = "reports"; // subdirectory holding saved human-artifact LLM reports
 const FILES = {
   repoInfo: "repoInfo.json",
   configInfo: "configInfo.json",
   userContext: "userContext.md",
   dependencyMap: "dependencyMap.json",
   dependentMap: "dependentMap.json",
+  imports: "imports.json",
   report: "report.json",
   verifications: "verifications.json",
 } as const;
@@ -172,13 +175,85 @@ function recordVerification(repoRoot: string, entry: VerificationEntry): void {
   writeJson(agentFile(repoRoot, FILES.verifications), entries);
 }
 
+/**
+ * writeImports: persist the per-edge import seams (file -> file -> symbols crossing) built during
+ * the dependency-graph walk. Kept separate from the lean dependency maps so the hot ripple-walk
+ * never loads symbol detail.
+ */
+function writeImports(repoRoot: string, edges: ImportEdge[]): void {
+  ensureAgentDir(repoRoot);
+  writeJson(agentFile(repoRoot, FILES.imports), edges);
+}
+
+/**
+ * readImports: load .agent/imports.json (the import seams) for the LLM layer. Returns [] when absent;
+ * a corrupt/non-array file logs a descriptive warning and degrades to [] rather than crashing.
+ */
+function readImports(repoRoot: string): ImportEdge[] {
+  const file = agentFile(repoRoot, FILES.imports);
+  if (!existsSync(file)) {
+    return [];
+  }
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
+    if (Array.isArray(parsed)) {
+      return parsed as ImportEdge[];
+    }
+    console.warn(`Warning: ${file} is not a valid imports list; treating it as empty.`);
+    return [];
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`Warning: could not read ${file}; treating it as empty. ${message}`);
+    return [];
+  }
+}
+
+/**
+ * readUserContext: load the developer-written project context (userContext.md). Returns "" when the
+ * file is absent or unreadable — context is optional and its absence is not an error.
+ */
+function readUserContext(repoRoot: string): string {
+  const file = agentFile(repoRoot, FILES.userContext);
+  if (!existsSync(file)) {
+    return "";
+  }
+  try {
+    return readFileSync(file, "utf8");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`Warning: could not read ${file}; treating context as empty. ${message}`);
+    return "";
+  }
+}
+
+/**
+ * writeHeuristicReport: save a human-artifact LLM report as markdown under .agent/reports/, named
+ * with an ISO timestamp so reports never clobber each other. Takes the already-formatted markdown
+ * (formatting lives in src/llm/report.ts — this module only does file I/O). Returns the written path.
+ *
+ * These saved reports are for the developer to read and are NEVER fed back into future prompts.
+ */
+function writeHeuristicReport(repoRoot: string, markdown: string): string {
+  const reportsDir = path.join(agentDir(repoRoot), REPORTS_DIR);
+  mkdirSync(reportsDir, { recursive: true });
+  // Colons aren't filesystem-safe on all platforms; replace them so the ISO stamp is a valid name.
+  const stamp = new Date().toISOString().replace(/:/g, "-");
+  const reportPath = path.join(reportsDir, `report-${stamp}.md`);
+  writeFileSync(reportPath, markdown.endsWith("\n") ? markdown : `${markdown}\n`, "utf8");
+  return reportPath;
+}
+
 export {
   dependencyGraphExists,
   initializeDependencyGraph,
   readDependentMap,
+  readImports,
+  readUserContext,
   readVerifications,
   recordVerification,
   writeAgentState,
   writeDependencyMaps,
+  writeHeuristicReport,
+  writeImports,
   writeReport,
 };

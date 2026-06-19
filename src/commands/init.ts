@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { writeAgentState } from "../state/agentState.js";
+import { promptForLLM } from "../state/llmConfig.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -159,6 +160,10 @@ async function runInit(): Promise<void> {
   const context = await promptForContext();
 
   writeAgentState(repoRoot, config, context);
+
+  // Optional LLM heuristic-analysis setup (opt-in). Writes llmConfig.json (and, if enabled and no
+  // key is found, prompts for + saves an API key). No analysis happens here — there is no diff yet.
+  await promptForLLM(repoRoot);
 
   console.log(`Agent state saved to ${path.join(repoRoot, ".agent")}`);
 }

@@ -31,6 +31,16 @@ interface Hunk {
 interface FileDiff {
   filePath: string; // relative to repoRoot
   hunks: Hunk[];
+  additions: string[]; // new-side added lines (content, without the leading "+")
+  deletions: string[]; // old-side removed lines (content, without the leading "-")
+}
+
+// One edge of the import graph with the symbols that cross it — written to .agent/imports.json.
+// Kept separate from the lean dependency maps so the hot ripple-walk never loads symbol detail.
+interface ImportEdge {
+  importer: string; // file doing the importing, relative to repoRoot
+  imported: string; // resolved file being imported, relative to repoRoot
+  symbols: string[]; // named symbols crossing this edge, OR ["all"], OR ["default"]
 }
 
 // --- Analysis outputs (the contents of report.json) ---
@@ -111,6 +121,7 @@ export type {
   Diagnostic,
   FileDiff,
   Hunk,
+  ImportEdge,
   ReportEntry,
   ReportSummary,
   SymbolMap,

@@ -149,7 +149,12 @@ describe("typeCheckAnalysis", () => {
     write(repoRoot, "bad.ts", 'export const n: number = "not a number";\n');
 
     const diffs: FileDiff[] = [
-      { filePath: "bad.ts", hunks: [{ startLine: 1, lineCount: 1 }] },
+      {
+        filePath: "bad.ts",
+        hunks: [{ startLine: 1, lineCount: 1 }],
+        additions: ['export const n: number = "not a number";'],
+        deletions: [],
+      },
     ];
 
     const diagnostics = typeCheckAnalysis(diffs, repoRoot);
@@ -172,7 +177,12 @@ describe("typeCheckAnalysis", () => {
     write(repoRoot, "bad.ts", 'export const n: number = "not a number";\n');
 
     const diffs: FileDiff[] = [
-      { filePath: "bad.ts", hunks: [{ startLine: 50, lineCount: 2 }] },
+      {
+        filePath: "bad.ts",
+        hunks: [{ startLine: 50, lineCount: 2 }],
+        additions: [],
+        deletions: [],
+      },
     ];
 
     const diagnostics = typeCheckAnalysis(diffs, repoRoot);
@@ -193,7 +203,12 @@ describe("typeCheckAnalysis", () => {
     write(repoRoot, "untouched.ts", 'export const b: number = "also nope";\n');
 
     const diffs: FileDiff[] = [
-      { filePath: "changed.ts", hunks: [{ startLine: 1, lineCount: 1 }] },
+      {
+        filePath: "changed.ts",
+        hunks: [{ startLine: 1, lineCount: 1 }],
+        additions: ['export const a: number = "nope";'],
+        deletions: [],
+      },
     ];
 
     const diagnostics = typeCheckAnalysis(diffs, repoRoot);
@@ -218,7 +233,12 @@ describe("runDiffAnalysis", () => {
     });
 
     const diffs: FileDiff[] = [
-      { filePath: "lib.ts", hunks: [{ startLine: 1, lineCount: 1 }] },
+      {
+        filePath: "lib.ts",
+        hunks: [{ startLine: 1, lineCount: 1 }],
+        additions: ["export const value = 42;"],
+        deletions: [],
+      },
     ];
 
     const report = runDiffAnalysis(diffs, repoRoot, emptyConfig());

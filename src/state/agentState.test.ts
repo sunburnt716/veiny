@@ -14,16 +14,21 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { ConfigSnapshot } from "../commands/init.js";
 import type {
   DependentMap,
+  ImportEdge,
   ReportEntry,
   VerificationEntry,
 } from "../core/types.js";
 import {
   dependencyGraphExists,
   readDependentMap,
+  readImports,
+  readUserContext,
   readVerifications,
   recordVerification,
   writeAgentState,
   writeDependencyMaps,
+  writeHeuristicReport,
+  writeImports,
   writeReport,
 } from "./agentState.js";
 
@@ -254,5 +259,79 @@ describe("readVerifications", () => {
     );
 
     expect(readVerifications(repoRoot)).toEqual([]);
+  });
+});
+
+describe("writeImports / readImports", () => {
+  it("round-trips an ImportEdge[] through disk", () => {
+    const repoRoot = makeTempDir();
+    const edges: ImportEdge[] = [
+      { importer: "src/a.ts", imported: "src/b.ts", symbols: ["thing"] },
+      { importer: "src/c.ts", imported: "src/b.ts", symbols: ["all"] },
+    ];
+
+    writeImports(repoRoot, edges);
+
+    expect(readImports(repoRoot)).toEqual(edges);
+
+    // And the on-disk file is exactly that array of edges.
+    const onDisk: unknown = JSON.parse(
+      readFileSync(path.join(repoRoot, ".agent", "imports.json"), "utf8"),
+    );
+    expect(onDisk).toEqual(edges);
+  });
+
+  it("returns [] when imports.json is absent", () => {
+    const repoRoot = makeTempDir();
+
+    expect(readImports(repoRoot)).toEqual([]);
+  });
+
+  it("degrades to [] for corrupt JSON without throwing", () => {
+    const repoRoot = makeTempDir();
+    mkdirSync(path.join(repoRoot, ".agent"), { recursive: true });
+    writeFileSync(
+      path.join(repoRoot, ".agent", "imports.json"),
+      "{ not valid json",
+      "utf8",
+    );
+
+    expect(() => readImports(repoRoot)).not.toThrow();
+    expect(readImports(repoRoot)).toEqual([]);
+  });
+});
+
+describe("readUserContext", () => {
+  it("returns the file contents when userContext.md is present", () => {
+    const repoRoot = makeTempDir();
+    writeAgentState(repoRoot, emptyConfig(), "my project context");
+
+    expect(readUserContext(repoRoot)).toContain("my project context");
+  });
+
+  it('returns "" when userContext.md is absent', () => {
+    const repoRoot = makeTempDir();
+
+    expect(readUserContext(repoRoot)).toBe("");
+  });
+});
+
+describe("writeHeuristicReport", () => {
+  it("writes a markdown report under .agent/reports/ and returns its path", () => {
+    const repoRoot = makeTempDir();
+    const markdown = "# Veiny Risk Analysis\n\nSome findings.";
+
+    const reportPath = writeHeuristicReport(repoRoot, markdown);
+
+    // The returned path lives under .agent/reports/ and is named report-*.md.
+    const reportsDir = path.join(repoRoot, ".agent", "reports");
+    expect(reportPath.startsWith(reportsDir)).toBe(true);
+    const base = path.basename(reportPath);
+    expect(base.startsWith("report-")).toBe(true);
+    expect(base.endsWith(".md")).toBe(true);
+
+    // The file exists and contains the passed markdown.
+    expect(existsSync(reportPath)).toBe(true);
+    expect(readFileSync(reportPath, "utf8")).toContain("Some findings.");
   });
 });
