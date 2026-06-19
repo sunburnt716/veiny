@@ -1,24 +1,40 @@
 {
   "name": "veiny",
   "version": "1.0.0",
-  "description": "",
+  "description": "A CLI developer tool that maps a codebase into a dependency graph and analyzes staged git diffs — deterministic type-check + blast radius, plus an optional provider-agnostic LLM risk report — before commits land.",
   "type": "module",
   "main": "dist/index.js",
+  "bin": {
+    "veiny": "dist/index.js"
+  },
   "scripts": {
     "build": "tsc",
     "start": "tsx src/index.ts",
+    "veiny": "tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"
   },
+  "keywords": [
+    "cli",
+    "dependency-graph",
+    "static-analysis",
+    "git",
+    "pre-commit",
+    "typescript",
+    "ast",
+    "babel",
+    "llm",
+    "developer-tools"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/sunburnt716/veiny.git"
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
+  "license": "MIT",
   "bugs": {
     "url": "https://github.com/sunburnt716/veiny/issues"
   },

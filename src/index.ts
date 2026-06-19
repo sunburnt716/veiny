@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import { captureConfig, runInit, validateGitRepo } from "./commands/init.js";
 import { runWatch } from "./commands/watch.js";
 import {
